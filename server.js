@@ -96,8 +96,9 @@ function connectOpenAI() {
           session: {
             input_audio_format: { type: "pcm16", sample_rate: 16000 },
             output_audio_format: { type: "pcm16", sample_rate: 16000 },
+            // Let the server VAD handle turns. Do NOT call commit manually.
+            turn_detection: { type: "server_vad", silence_duration_ms: 300 },
             input_audio_transcription: { enabled: true },
-            turn_detection: { type: "server_vad" },
             voice: OPENAI_VOICE,
           },
         })
@@ -125,7 +126,7 @@ wss.on("connection", (twilioWS) => {
   let streamSid = null;
   let oaiWS = null;
 
-  // playback queue to Twilio
+  // playback queue → Twilio
   const ttsQueue = [];
   const ttsTimer = setInterval(() => {
     if (!streamSid || ttsQueue.length === 0) return;
@@ -139,32 +140,13 @@ wss.on("connection", (twilioWS) => {
     } catch {}
   }, 20);
 
-  // response + barge-in state
+  // response state for barge-in
   let responseActive = false;
-  let wantResponse = false; // we want the model to speak when current one ends
-  let lastCancelTs = 0;
   function bargeIn() {
-    if (!responseActive) return; // only cancel if one is active
-    const now = Date.now();
-    if (now - lastCancelTs <= 250) return;
+    if (!responseActive) return;
     oaiWS?.send(JSON.stringify({ type: "response.cancel" }));
     responseActive = false;
-    lastCancelTs = now;
   }
-
-  // exact audio accounting at 16k
-  let pendingSamples16k = 0; // samples waiting to commit
-  const MIN_SAMPLES_100MS = 1600; // 100ms * 16000Hz
-
-  // commit by timer to avoid short commits (host jitter etc.)
-  const commitTimer = setInterval(() => {
-    if (!oaiWS) return;
-    if (pendingSamples16k >= MIN_SAMPLES_100MS) {
-      oaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-      pendingSamples16k = 0;
-      wantResponse = true; // ask to speak when safe
-    }
-  }, 150); // >=100ms safety
 
   twilioWS.on("message", async (raw) => {
     let msg;
@@ -192,32 +174,33 @@ wss.on("connection", (twilioWS) => {
         } catch {
           return;
         }
-        if (m.type && m.type !== "response.output_audio.delta")
+        // Log useful states
+        if (
+          m.type &&
+          !["response.output_audio.delta", "response.audio.delta"].includes(
+            m.type
+          )
+        )
           console.log("OAI:", m.type);
 
         if (m.type === "response.created") responseActive = true;
-        if (m.type === "response.done") {
-          responseActive = false;
-          // if we were waiting for a response (after a commit), trigger now
-          if (wantResponse) {
-            oaiWS?.send(JSON.stringify({ type: "response.create" }));
-            responseActive = true;
-            wantResponse = false;
-          }
+        if (m.type === "response.done") responseActive = false;
+
+        // audio out (new + legacy)
+        const payload = m.audio || m.delta;
+        if (
+          (m.type === "response.output_audio.delta" ||
+            m.type === "output_audio_buffer.delta") &&
+          payload
+        ) {
+          const b = Buffer.from(payload, "base64");
+          ttsQueue.push(new Int16Array(b.buffer, b.byteOffset, b.length / 2));
         }
 
-        if (m.type === "response.output_audio.delta" && m.audio) {
-          const b = Buffer.from(m.audio, "base64");
-          ttsQueue.push(new Int16Array(b.buffer, b.byteOffset, b.length / 2));
-        }
-        if (m.type === "output_audio_buffer.delta" && m.delta) {
-          const b = Buffer.from(m.delta, "base64");
-          ttsQueue.push(new Int16Array(b.buffer, b.byteOffset, b.length / 2));
-        }
         if (m.type === "error") console.error("OAI error", m);
       });
 
-      // greeting
+      // one greeting; after this, VAD drives turns
       oaiWS.send(
         JSON.stringify({
           type: "response.create",
@@ -230,21 +213,17 @@ wss.on("connection", (twilioWS) => {
     }
 
     if (msg.event === "media" && oaiWS) {
-      // user speaks -> cancel any TTS
-      bargeIn();
+      // caller spoke → barge-in if needed, then just append. No commits.
+      if (responseActive) bargeIn();
 
-      // μ-law@8k -> PCM16@8k -> PCM16@16k
       const pcm8k = ulawFrameToPcm16Array(msg.media.payload);
       const pcm16k = pcm8kTo16k(pcm8k);
-
-      // append to OpenAI buffer
       const b64 = Buffer.from(pcm16k.buffer).toString("base64");
       oaiWS.send(
         JSON.stringify({ type: "input_audio_buffer.append", audio: b64 })
       );
-
-      // count duration for safe commit
-      pendingSamples16k += pcm16k.length; // 20ms frame -> 320 samples
+      // Do NOT send input_audio_buffer.commit here. VAD will commit automatically.
+      // Do NOT call response.create here. VAD will create responses.
     }
 
     if (msg.event === "stop") {
@@ -260,7 +239,6 @@ wss.on("connection", (twilioWS) => {
 
   twilioWS.on("close", () => {
     clearInterval(ttsTimer);
-    clearInterval(commitTimer);
     try {
       oaiWS && oaiWS.close();
     } catch {}
