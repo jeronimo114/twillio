@@ -139,21 +139,32 @@ wss.on("connection", (twilioWS) => {
     } catch {}
   }, 20);
 
-  // response state and barge-in
+  // response + barge-in state
   let responseActive = false;
+  let wantResponse = false; // we want the model to speak when current one ends
   let lastCancelTs = 0;
   function bargeIn() {
+    if (!responseActive) return; // only cancel if one is active
     const now = Date.now();
-    if (oaiWS && responseActive && now - lastCancelTs > 250) {
-      oaiWS.send(JSON.stringify({ type: "response.cancel" }));
-      responseActive = false;
-      lastCancelTs = now;
-    }
+    if (now - lastCancelTs <= 250) return;
+    oaiWS?.send(JSON.stringify({ type: "response.cancel" }));
+    responseActive = false;
+    lastCancelTs = now;
   }
 
   // exact audio accounting at 16k
   let pendingSamples16k = 0; // samples waiting to commit
   const MIN_SAMPLES_100MS = 1600; // 100ms * 16000Hz
+
+  // commit by timer to avoid short commits (host jitter etc.)
+  const commitTimer = setInterval(() => {
+    if (!oaiWS) return;
+    if (pendingSamples16k >= MIN_SAMPLES_100MS) {
+      oaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+      pendingSamples16k = 0;
+      wantResponse = true; // ask to speak when safe
+    }
+  }, 150); // >=100ms safety
 
   twilioWS.on("message", async (raw) => {
     let msg;
@@ -185,7 +196,15 @@ wss.on("connection", (twilioWS) => {
           console.log("OAI:", m.type);
 
         if (m.type === "response.created") responseActive = true;
-        if (m.type === "response.done") responseActive = false;
+        if (m.type === "response.done") {
+          responseActive = false;
+          // if we were waiting for a response (after a commit), trigger now
+          if (wantResponse) {
+            oaiWS?.send(JSON.stringify({ type: "response.create" }));
+            responseActive = true;
+            wantResponse = false;
+          }
+        }
 
         if (m.type === "response.output_audio.delta" && m.audio) {
           const b = Buffer.from(m.audio, "base64");
@@ -198,7 +217,7 @@ wss.on("connection", (twilioWS) => {
         if (m.type === "error") console.error("OAI error", m);
       });
 
-      // optional greeting
+      // greeting
       oaiWS.send(
         JSON.stringify({
           type: "response.create",
@@ -207,6 +226,7 @@ wss.on("connection", (twilioWS) => {
           },
         })
       );
+      responseActive = true;
     }
 
     if (msg.event === "media" && oaiWS) {
@@ -223,18 +243,8 @@ wss.on("connection", (twilioWS) => {
         JSON.stringify({ type: "input_audio_buffer.append", audio: b64 })
       );
 
-      // accumulate and commit only when ≥100ms
+      // count duration for safe commit
       pendingSamples16k += pcm16k.length; // 20ms frame -> 320 samples
-      if (pendingSamples16k >= MIN_SAMPLES_100MS) {
-        oaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-        pendingSamples16k = 0;
-
-        // request a response only if none is active
-        if (!responseActive) {
-          oaiWS.send(JSON.stringify({ type: "response.create" }));
-          responseActive = true;
-        }
-      }
     }
 
     if (msg.event === "stop") {
@@ -250,6 +260,7 @@ wss.on("connection", (twilioWS) => {
 
   twilioWS.on("close", () => {
     clearInterval(ttsTimer);
+    clearInterval(commitTimer);
     try {
       oaiWS && oaiWS.close();
     } catch {}
