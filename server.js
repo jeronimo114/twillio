@@ -3,51 +3,51 @@ import express from "express";
 import { createServer } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 
-/* ====================== ENV ====================== */
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // required
+/* ========= ENV ========= */
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-realtime-preview";
 const OPENAI_VOICE = process.env.OPENAI_VOICE || "alloy";
 const PORT = process.env.PORT || 10000;
 
-/* ================ AUDIO HELPERS =================== */
+/* ===== AUDIO HELPERS ===== */
 // μ-law <-> PCM16
 function ulawToPcm16(u) {
-  u = ~u & 0xff;
-  const sign = u & 0x80 ? -1 : 1;
-  const exponent = (u >> 4) & 0x07;
-  const mantissa = u & 0x0f;
-  let sample = ((mantissa << 3) + 0x84) << exponent;
-  sample -= 0x84 << exponent;
-  return sign * sample;
+  u = ~u & 255;
+  const s = u & 128 ? -1 : 1,
+    e = (u >> 4) & 7,
+    m = u & 15;
+  let x = ((m << 3) + 132) << e;
+  x -= 132 << e;
+  return s * x;
 }
-function pcm16ToUlaw(pcm) {
-  const BIAS = 0x84;
-  const sign = pcm < 0 ? 0x80 : 0x00;
-  pcm = Math.abs(pcm);
-  if (pcm > 32635) pcm = 32635;
-  pcm += BIAS;
-  let exponent = 7;
-  for (let e = 7; e > 0; e--) {
-    if (pcm & (0x1f80 << (e - 1))) {
-      exponent = e;
+function pcm16ToUlaw(p) {
+  const B = 132;
+  const s = p < 0 ? 128 : 0;
+  let x = Math.abs(p);
+  if (x > 32635) x = 32635;
+  x += B;
+  let e = 7;
+  for (let i = 7; i > 0; i--) {
+    if (x & (8064 << (i - 1))) {
+      e = i;
       break;
     }
   }
-  const mantissa = (pcm >> (exponent + 3)) & 0x0f;
-  return ~(sign | (exponent << 4) | mantissa) & 0xff;
+  const m = (x >> (e + 3)) & 15;
+  return ~(s | (e << 4) | m) & 255;
 }
 function ulawFrameToPcm16Array(b64) {
-  const bytes = Buffer.from(b64, "base64");
-  const out = new Int16Array(bytes.length);
-  for (let i = 0; i < bytes.length; i++) out[i] = ulawToPcm16(bytes[i]);
+  const b = Buffer.from(b64, "base64");
+  const out = new Int16Array(b.length);
+  for (let i = 0; i < b.length; i++) out[i] = ulawToPcm16(b[i]);
   return out;
 }
 function pcm16ArrayToUlawFrame(int16) {
-  const bytes = Buffer.alloc(int16.length);
-  for (let i = 0; i < int16.length; i++) bytes[i] = pcm16ToUlaw(int16[i]);
-  return Buffer.from(bytes).toString("base64");
+  const b = Buffer.alloc(int16.length);
+  for (let i = 0; i < int16.length; i++) b[i] = pcm16ToUlaw(int16[i]);
+  return Buffer.from(b).toString("base64");
 }
-// naive 8k ↔ 16k (good enough for PoC)
+// naive 8k <-> 16k
 function pcm8kTo16k(x8) {
   const y = new Int16Array(x8.length * 2);
   for (let i = 0; i < x8.length - 1; i++) {
@@ -56,9 +56,8 @@ function pcm8kTo16k(x8) {
     y[2 * i] = a;
     y[2 * i + 1] = (a + b) >> 1;
   }
-  const last = x8[x8.length - 1];
-  y[y.length - 2] = last;
-  y[y.length - 1] = last;
+  y[y.length - 2] = x8[x8.length - 1];
+  y[y.length - 1] = x8[x8.length - 1];
   return y;
 }
 function pcm16kTo8k(x16) {
@@ -67,20 +66,18 @@ function pcm16kTo8k(x16) {
   return y;
 }
 
-/* ==================== HTTP + WS =================== */
+/* ===== HTTP + WS ===== */
 const app = express();
-app.get("/", (_req, res) => res.send("OK")); // health
+app.get("/", (_r, res) => res.send("OK"));
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: "/twilio" });
-
-// keepalive
 setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.readyState === ws.OPEN) ws.ping();
   });
 }, 25000);
 
-/* ================ OPENAI REALTIME ================= */
+/* ===== OpenAI Realtime ===== */
 function connectOpenAI() {
   return new Promise((resolve, reject) => {
     const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(
@@ -91,7 +88,6 @@ function connectOpenAI() {
       "OpenAI-Beta": "realtime=v1",
     };
     const ws = new WebSocket(url, { headers });
-
     ws.on("open", () => {
       console.log("OpenAI WS open");
       ws.send(
@@ -108,19 +104,17 @@ function connectOpenAI() {
       );
       resolve(ws);
     });
-    ws.on("close", (c, r) =>
-      console.log("OpenAI WS close", c, r?.toString?.() || "")
-    );
     ws.on("error", (e) => {
       console.error("OpenAI WS error", e);
       reject(e);
     });
-
-    // caller handles messages (we attach per-connection below)
+    ws.on("close", (c, r) =>
+      console.log("OpenAI WS close", c, r?.toString?.() || "")
+    );
   });
 }
 
-/* =================== BRIDGE LOOP ================== */
+/* ===== Bridge ===== */
 wss.on("connection", (twilioWS) => {
   console.log("Twilio WS connected");
   if (!OPENAI_API_KEY) {
@@ -130,10 +124,9 @@ wss.on("connection", (twilioWS) => {
 
   let streamSid = null;
   let oaiWS = null;
-  const ttsQueue = []; // PCM16@16k chunks from OpenAI
-  let mediaFrameCount = 0;
 
-  // pace TTS back to Twilio ~20ms
+  // playback queue to Twilio
+  const ttsQueue = [];
   const ttsTimer = setInterval(() => {
     if (!streamSid || ttsQueue.length === 0) return;
     const pcm16k = ttsQueue.shift();
@@ -143,10 +136,30 @@ wss.on("connection", (twilioWS) => {
       twilioWS.send(
         JSON.stringify({ event: "media", streamSid, media: { payload: b64 } })
       );
-    } catch (_) {}
+    } catch {}
   }, 20);
 
-  // Twilio → Edge
+  // track response state to avoid overlap
+  let responseActive = false;
+  // user audio buffer accounting
+  let framesSinceCommit = 0; // Twilio frames since last commit (20 ms each)
+  const COMMIT_EVERY_FRAMES = 6; // 6*20ms = 120ms >= 100ms requirement
+  let lastCancelTs = 0;
+
+  function maybeCreateResponse() {
+    if (!oaiWS || responseActive) return;
+    oaiWS.send(JSON.stringify({ type: "response.create" }));
+    responseActive = true;
+  }
+  function bargeIn() {
+    const now = Date.now();
+    if (oaiWS && responseActive && now - lastCancelTs > 250) {
+      oaiWS.send(JSON.stringify({ type: "response.cancel" }));
+      responseActive = false;
+      lastCancelTs = now;
+    }
+  }
+
   twilioWS.on("message", async (raw) => {
     let msg;
     try {
@@ -159,15 +172,13 @@ wss.on("connection", (twilioWS) => {
       streamSid = msg.streamSid;
       console.log("start", { callSid: msg.start.callSid, streamSid });
 
-      // connect OpenAI
       try {
         oaiWS = await connectOpenAI();
-      } catch (e) {
-        console.error("OpenAI connect failed", e);
+      } catch {
         return;
       }
 
-      // attach OpenAI message handler
+      // OpenAI events
       oaiWS.on("message", (buf) => {
         let m;
         try {
@@ -178,12 +189,13 @@ wss.on("connection", (twilioWS) => {
         if (m.type && m.type !== "response.output_audio.delta")
           console.log("OAI:", m.type);
 
-        // new schema
+        if (m.type === "response.created") responseActive = true;
+        if (m.type === "response.done") responseActive = false;
+
         if (m.type === "response.output_audio.delta" && m.audio) {
           const b = Buffer.from(m.audio, "base64");
           ttsQueue.push(new Int16Array(b.buffer, b.byteOffset, b.length / 2));
         }
-        // older schema
         if (m.type === "output_audio_buffer.delta" && m.delta) {
           const b = Buffer.from(m.delta, "base64");
           ttsQueue.push(new Int16Array(b.buffer, b.byteOffset, b.length / 2));
@@ -191,7 +203,7 @@ wss.on("connection", (twilioWS) => {
         if (m.type === "error") console.error("OAI error", m);
       });
 
-      // optional greeting so you hear audio without speaking first
+      // optional greeting
       oaiWS.send(
         JSON.stringify({
           type: "response.create",
@@ -203,20 +215,24 @@ wss.on("connection", (twilioWS) => {
     }
 
     if (msg.event === "media" && oaiWS) {
-      // μ-law@8k -> PCM16@8k -> PCM16@16k
+      // barge-in if TTS is speaking
+      bargeIn();
+
+      // append 20ms caller audio
       const pcm8k = ulawFrameToPcm16Array(msg.media.payload);
       const pcm16k = pcm8kTo16k(pcm8k);
       const b64 = Buffer.from(pcm16k.buffer).toString("base64");
-      // append caller audio
       oaiWS.send(
         JSON.stringify({ type: "input_audio_buffer.append", audio: b64 })
       );
 
-      // commit every ~100ms to balance latency vs ASR quality
-      mediaFrameCount++;
-      if (mediaFrameCount % 5 === 0) {
+      // commit only every ≥120ms to satisfy buffer minimum
+      framesSinceCommit++;
+      if (framesSinceCommit >= COMMIT_EVERY_FRAMES) {
         oaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-        oaiWS.send(JSON.stringify({ type: "response.create" }));
+        framesSinceCommit = 0;
+        // request a response if none active
+        maybeCreateResponse();
       }
     }
 
@@ -224,10 +240,10 @@ wss.on("connection", (twilioWS) => {
       console.log("stop", { streamSid });
       try {
         oaiWS && oaiWS.close();
-      } catch (_) {}
+      } catch {}
       try {
         twilioWS.close();
-      } catch (_) {}
+      } catch {}
     }
   });
 
@@ -235,12 +251,9 @@ wss.on("connection", (twilioWS) => {
     clearInterval(ttsTimer);
     try {
       oaiWS && oaiWS.close();
-    } catch (_) {}
+    } catch {}
     console.log("Twilio WS closed");
   });
 });
 
-/* ==================== START ======================= */
-server.listen(PORT, () => {
-  console.log(`Edge up on port ${PORT} path /twilio`);
-});
+server.listen(PORT, () => console.log(`Edge up on port ${PORT} path /twilio`));
