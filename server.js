@@ -4,7 +4,7 @@ import { createServer } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 
 /* ========= ENV ========= */
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // required
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-realtime-preview";
 const OPENAI_VOICE = process.env.OPENAI_VOICE || "alloy";
 const PORT = process.env.PORT || 10000;
@@ -47,7 +47,7 @@ function pcm16ArrayToUlawFrame(int16) {
   for (let i = 0; i < int16.length; i++) b[i] = pcm16ToUlaw(int16[i]);
   return Buffer.from(b).toString("base64");
 }
-// naive 8k <-> 16k
+// naive 8k <-> 16k (good enough for PoC)
 function pcm8kTo16k(x8) {
   const y = new Int16Array(x8.length * 2);
   for (let i = 0; i < x8.length - 1; i++) {
@@ -139,18 +139,9 @@ wss.on("connection", (twilioWS) => {
     } catch {}
   }, 20);
 
-  // track response state to avoid overlap
+  // response state and barge-in
   let responseActive = false;
-  // user audio buffer accounting
-  let framesSinceCommit = 0; // Twilio frames since last commit (20 ms each)
-  const COMMIT_EVERY_FRAMES = 6; // 6*20ms = 120ms >= 100ms requirement
   let lastCancelTs = 0;
-
-  function maybeCreateResponse() {
-    if (!oaiWS || responseActive) return;
-    oaiWS.send(JSON.stringify({ type: "response.create" }));
-    responseActive = true;
-  }
   function bargeIn() {
     const now = Date.now();
     if (oaiWS && responseActive && now - lastCancelTs > 250) {
@@ -159,6 +150,10 @@ wss.on("connection", (twilioWS) => {
       lastCancelTs = now;
     }
   }
+
+  // exact audio accounting at 16k
+  let pendingSamples16k = 0; // samples waiting to commit
+  const MIN_SAMPLES_100MS = 1600; // 100ms * 16000Hz
 
   twilioWS.on("message", async (raw) => {
     let msg;
@@ -215,24 +210,30 @@ wss.on("connection", (twilioWS) => {
     }
 
     if (msg.event === "media" && oaiWS) {
-      // barge-in if TTS is speaking
+      // user speaks -> cancel any TTS
       bargeIn();
 
-      // append 20ms caller audio
+      // μ-law@8k -> PCM16@8k -> PCM16@16k
       const pcm8k = ulawFrameToPcm16Array(msg.media.payload);
       const pcm16k = pcm8kTo16k(pcm8k);
+
+      // append to OpenAI buffer
       const b64 = Buffer.from(pcm16k.buffer).toString("base64");
       oaiWS.send(
         JSON.stringify({ type: "input_audio_buffer.append", audio: b64 })
       );
 
-      // commit only every ≥120ms to satisfy buffer minimum
-      framesSinceCommit++;
-      if (framesSinceCommit >= COMMIT_EVERY_FRAMES) {
+      // accumulate and commit only when ≥100ms
+      pendingSamples16k += pcm16k.length; // 20ms frame -> 320 samples
+      if (pendingSamples16k >= MIN_SAMPLES_100MS) {
         oaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-        framesSinceCommit = 0;
-        // request a response if none active
-        maybeCreateResponse();
+        pendingSamples16k = 0;
+
+        // request a response only if none is active
+        if (!responseActive) {
+          oaiWS.send(JSON.stringify({ type: "response.create" }));
+          responseActive = true;
+        }
       }
     }
 
